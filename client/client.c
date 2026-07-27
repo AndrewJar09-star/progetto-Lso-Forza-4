@@ -101,9 +101,6 @@ static void handle_server_packet(const Packet *pkt) {
         printf("\n%s%s%s\n", COLOR_MAGENTA, pkt->text, COLOR_RESET);
         if (g_state == CLI_STATE_LOBBY) {
             print_menu(g_nickname);
-        } else if (g_state == CLI_STATE_WAITING_HOST) {
-            printf("%s[In attesa di sfidanti per la partita #%d...]%s\n",
-                   COLOR_YELLOW, g_match_id, COLOR_RESET);
         }
         fflush(stdout);
         break;
@@ -116,13 +113,14 @@ static void handle_server_packet(const Packet *pkt) {
 
     case MSG_CREATE_MATCH_ACK:
         if (pkt->status == 1) {
-            g_match_id = pkt->match_id;
-            g_state    = CLI_STATE_WAITING_HOST;
+            g_state = CLI_STATE_LOBBY;
             printf("\n%s%s%s\n", COLOR_GREEN, pkt->text, COLOR_RESET);
-            printf("%s[In attesa di sfidanti per la partita #%d...]%s\n",
-                   COLOR_YELLOW, g_match_id, COLOR_RESET);
+            printf("%s(Partita #%d creata ed in attesa. Puoi crearne altre dal menu.)%s\n",
+                   COLOR_YELLOW, pkt->match_id, COLOR_RESET);
+            print_menu(g_nickname);
         } else {
             printf("\n%s%s%s\n", COLOR_RED, pkt->text, COLOR_RESET);
+            g_state = CLI_STATE_LOBBY;
             print_menu(g_nickname);
         }
         fflush(stdout);
@@ -308,12 +306,12 @@ static void handle_user_line(char *line) {
         send_packet(&resp);
         if (accept) {
             printf("%s[Richiesta accettata! Attendo avvio partita...]%s\n", COLOR_GREEN, COLOR_RESET);
-            g_state = CLI_STATE_WAITING_HOST;
+            g_match_id = g_join_mid;
+            g_state    = CLI_STATE_JOIN_WAIT;
         } else {
             printf("%s[Richiesta rifiutata.]%s\n", COLOR_RED, COLOR_RESET);
-            printf("%s[In attesa di nuovi sfidanti per la partita #%d...]%s\n",
-                   COLOR_YELLOW, g_match_id, COLOR_RESET);
-            g_state = CLI_STATE_WAITING_HOST;
+            g_state = CLI_STATE_LOBBY;
+            print_menu(g_nickname);
         }
         fflush(stdout);
         break;
@@ -347,8 +345,9 @@ static void handle_user_line(char *line) {
         pkt.status   = choice;
         send_packet(&pkt);
         if (choice == 1) {
-            g_state = CLI_STATE_WAITING_HOST;
-            printf("%s[Nuova sessione aperta! In attesa di sfidanti...]%s\n", COLOR_GREEN, COLOR_RESET);
+            g_state = CLI_STATE_LOBBY;
+            printf("%s[Nuova sessione aperta per la partita #%d!]%s\n", COLOR_GREEN, g_match_id, COLOR_RESET);
+            print_menu(g_nickname);
         } else {
             g_match_id = -1;
             g_state    = CLI_STATE_LOBBY;

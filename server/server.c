@@ -149,49 +149,53 @@ void *client_handler(void *arg) {
 
             case MSG_CREATE_MATCH: {
                 pthread_mutex_lock(&server_mutex);
-                int slot = -1;
-                for (int i = 0; i < MAX_MATCHES; i++) {
-                    if (matches[i].state == MATCH_STATE_EMPTY) {
-                        slot = i;
-                        break;
-                    }
-                }
-
                 memset(&tx_pkt, 0, sizeof(Packet));
                 tx_pkt.type = MSG_CREATE_MATCH_ACK;
 
-                if (slot == -1) {
+                if (cli->active_match_id != -1) {
                     tx_pkt.status = 0;
-                    snprintf(tx_pkt.text, sizeof(tx_pkt.text), "Errore: limite massimo partite raggiunto.");
+                    snprintf(tx_pkt.text, sizeof(tx_pkt.text), "Non puoi creare una partita mentre sei gia' impegnato in una partita in corso (#%d).", cli->active_match_id);
                 } else {
-                    Match *m = &matches[slot];
-                    memset(m, 0, sizeof(Match));
-                    m->match_id = match_counter++;
-                    m->state = MATCH_STATE_WAITING;
-                    m->host_socket = (int)sock;
-                    m->guest_socket = -1;
-                    strncpy(m->host_nick, cli->nickname, MAX_NICKNAME - 1);
-                    m->host_nick[MAX_NICKNAME - 1] = '\0';
-                    init_grid(m->grid);
-                    m->current_turn = 1;
-                    m->winner = 0;
-                    m->host_rematch_choice = -1;
-                    m->guest_rematch_choice = -1;
-                    pthread_mutex_init(&m->mutex, NULL);
-                    pthread_cond_init(&m->cond, NULL);
+                    int slot = -1;
+                    for (int i = 0; i < MAX_MATCHES; i++) {
+                        if (matches[i].state == MATCH_STATE_EMPTY) {
+                            slot = i;
+                            break;
+                        }
+                    }
 
-                    cli->active_match_id = m->match_id;
+                    if (slot == -1) {
+                        tx_pkt.status = 0;
+                        snprintf(tx_pkt.text, sizeof(tx_pkt.text), "Errore: limite massimo partite raggiunto.");
+                    } else {
+                        Match *m = &matches[slot];
+                        memset(m, 0, sizeof(Match));
+                        m->match_id = match_counter++;
+                        m->state = MATCH_STATE_WAITING;
+                        m->host_socket = (int)sock;
+                        m->guest_socket = -1;
+                        strncpy(m->host_nick, cli->nickname, MAX_NICKNAME - 1);
+                        m->host_nick[MAX_NICKNAME - 1] = '\0';
+                        init_grid(m->grid);
+                        m->current_turn = 1;
+                        m->winner = 0;
+                        m->host_rematch_choice = -1;
+                        m->guest_rematch_choice = -1;
+                        pthread_mutex_init(&m->mutex, NULL);
+                        pthread_cond_init(&m->cond, NULL);
 
-                    tx_pkt.status = 1;
-                    tx_pkt.match_id = m->match_id;
-                    snprintf(tx_pkt.text, sizeof(tx_pkt.text), "Partita #%d creata con successo! In attesa di sfidanti...", m->match_id);
+                        /* Active match is set when game becomes IN_PROGRESS */
+                        tx_pkt.status = 1;
+                        tx_pkt.match_id = m->match_id;
+                        snprintf(tx_pkt.text, sizeof(tx_pkt.text), "Partita #%d creata con successo! In attesa di sfidanti...", m->match_id);
 
-                    char notif[256];
-                    snprintf(notif, sizeof(notif), "[NOTIFICA] Nuova partita #%d creata da %s (Stato: In Attesa)", m->match_id, cli->nickname);
-                    pthread_mutex_unlock(&server_mutex);
+                        char notif[256];
+                        snprintf(notif, sizeof(notif), "[NOTIFICA] Nuova partita #%d creata da %s (Stato: In Attesa)", m->match_id, cli->nickname);
+                        pthread_mutex_unlock(&server_mutex);
 
-                    broadcast_notification(notif, sock, INVALID_SOCKET);
-                    pthread_mutex_lock(&server_mutex);
+                        broadcast_notification(notif, sock, INVALID_SOCKET);
+                        pthread_mutex_lock(&server_mutex);
+                    }
                 }
                 pthread_mutex_unlock(&server_mutex);
 
@@ -218,26 +222,46 @@ void *client_handler(void *arg) {
                     tx_pkt.status = 0;
                     snprintf(tx_pkt.text, sizeof(tx_pkt.text), "Partita #%d non trovata o non disponibile.", target_id);
                     send_packet(sock, &tx_pkt);
+                } else if (cli->active_match_id != -1) {
+                    tx_pkt.status = 0;
+                    snprintf(tx_pkt.text, sizeof(tx_pkt.text), "Sei gia' impegnato in una partita in corso (#%d)! Puoi giocare solo a una partita alla volta.", cli->active_match_id);
+                    send_packet(sock, &tx_pkt);
                 } else if (target_match->host_socket == (int)sock) {
                     tx_pkt.status = 0;
                     snprintf(tx_pkt.text, sizeof(tx_pkt.text), "Non puoi unirti alla tua stessa partita!");
                     send_packet(sock, &tx_pkt);
                 } else {
-                    target_match->state = MATCH_STATE_JOIN_PENDING;
-                    target_match->guest_socket = (int)sock;
-                    strncpy(target_match->guest_nick, cli->nickname, MAX_NICKNAME - 1);
+                    int host_busy = 0;
+                    for (int ci = 0; ci < MAX_CLIENTS; ci++) {
+                        if (clients[ci].in_use && clients[ci].sock == (SOCKET)target_match->host_socket) {
+                            if (clients[ci].active_match_id != -1) host_busy = 1;
+                            break;
+                        }
+                    }
 
-                    /* Notify host */
-                    Packet prompt_pkt;
-                    memset(&prompt_pkt, 0, sizeof(Packet));
-                    prompt_pkt.type = MSG_JOIN_PROMPT;
-                    prompt_pkt.match_id = target_id;
-                    strncpy(prompt_pkt.sender_nick, cli->nickname, MAX_NICKNAME - 1);
-                    snprintf(prompt_pkt.text, sizeof(prompt_pkt.text),
-                             "L'utente %s ha chiesto di unirsi alla tua partita #%d! Accetti? (1=Accetta, 0=Rifiuta)",
-                             cli->nickname, target_id);
-                    
-                    send_packet((SOCKET)target_match->host_socket, &prompt_pkt);
+                    if (host_busy) {
+                        tx_pkt.status = 0;
+                        snprintf(tx_pkt.text, sizeof(tx_pkt.text),
+                                 "Il creatore della partita (%s) e' al momento impegnato in un'altra partita in corso.",
+                                 target_match->host_nick);
+                        send_packet(sock, &tx_pkt);
+                    } else {
+                        target_match->state = MATCH_STATE_JOIN_PENDING;
+                        target_match->guest_socket = (int)sock;
+                        strncpy(target_match->guest_nick, cli->nickname, MAX_NICKNAME - 1);
+
+                        /* Notify host */
+                        Packet prompt_pkt;
+                        memset(&prompt_pkt, 0, sizeof(Packet));
+                        prompt_pkt.type = MSG_JOIN_PROMPT;
+                        prompt_pkt.match_id = target_id;
+                        strncpy(prompt_pkt.sender_nick, cli->nickname, MAX_NICKNAME - 1);
+                        snprintf(prompt_pkt.text, sizeof(prompt_pkt.text),
+                                 "L'utente %s ha chiesto di unirsi alla tua partita #%d! Accetti? (1=Accetta, 0=Rifiuta)",
+                                 cli->nickname, target_id);
+                        
+                        send_packet((SOCKET)target_match->host_socket, &prompt_pkt);
+                    }
                 }
                 pthread_mutex_unlock(&server_mutex);
                 break;
@@ -258,7 +282,15 @@ void *client_handler(void *arg) {
 
                 if (m && m->state == MATCH_STATE_JOIN_PENDING) {
                     SOCKET guest_s = (SOCKET)m->guest_socket;
-                    if (accept) {
+                    int host_busy = 0, guest_busy = 0;
+                    for (int ci = 0; ci < MAX_CLIENTS; ci++) {
+                        if (clients[ci].in_use) {
+                            if (clients[ci].sock == (SOCKET)m->host_socket && clients[ci].active_match_id != -1) host_busy = 1;
+                            if (clients[ci].sock == guest_s && clients[ci].active_match_id != -1) guest_busy = 1;
+                        }
+                    }
+
+                    if (accept && !host_busy && !guest_busy) {
                         m->state = MATCH_STATE_IN_PROGRESS;
 
                         /* Update active_match_id for both host and guest clients */
@@ -318,14 +350,19 @@ void *client_handler(void *arg) {
                         pthread_mutex_lock(&server_mutex);
 
                     } else {
-                        /* Refused */
+                        /* Refused or busy */
                         m->state = MATCH_STATE_WAITING;
                         Packet g_pkt;
                         memset(&g_pkt, 0, sizeof(Packet));
                         g_pkt.type   = MSG_JOIN_RESULT;
                         g_pkt.status = 0;
-                        snprintf(g_pkt.text, sizeof(g_pkt.text),
-                                 "Il creatore %s ha RIFIUTATO la tua richiesta.", m->host_nick);
+                        if (!accept) {
+                            snprintf(g_pkt.text, sizeof(g_pkt.text),
+                                     "Il creatore %s ha RIFIUTATO la tua richiesta.", m->host_nick);
+                        } else {
+                            snprintf(g_pkt.text, sizeof(g_pkt.text),
+                                     "Impossibile avviare la partita: uno dei giocatori e' gia' impegnato in un'altra partita in corso.");
+                        }
                         send_packet(guest_s, &g_pkt);
 
                         m->guest_socket    = -1;
@@ -430,6 +467,14 @@ void *client_handler(void *arg) {
                     SOCKET notif_ex2 = (SOCKET)m->guest_socket;
                     pthread_mutex_unlock(&m->mutex);
 
+                    pthread_mutex_lock(&server_mutex);
+                    for (int ci = 0; ci < MAX_CLIENTS; ci++) {
+                        if (clients[ci].in_use && (clients[ci].sock == notif_ex1 || clients[ci].sock == notif_ex2)) {
+                            clients[ci].active_match_id = -1;
+                        }
+                    }
+                    pthread_mutex_unlock(&server_mutex);
+
                     char notif[256];
                     snprintf(notif, sizeof(notif), "[NOTIFICA] La partita #%d si e' conclusa! Vincitore: %s", notif_mid, win_nick);
                     broadcast_notification(notif, notif_ex1, notif_ex2);
@@ -462,6 +507,14 @@ void *client_handler(void *arg) {
                     SOCKET notif_ex1 = (SOCKET)m->host_socket;
                     SOCKET notif_ex2 = (SOCKET)m->guest_socket;
                     pthread_mutex_unlock(&m->mutex);
+
+                    pthread_mutex_lock(&server_mutex);
+                    for (int ci = 0; ci < MAX_CLIENTS; ci++) {
+                        if (clients[ci].in_use && (clients[ci].sock == notif_ex1 || clients[ci].sock == notif_ex2)) {
+                            clients[ci].active_match_id = -1;
+                        }
+                    }
+                    pthread_mutex_unlock(&server_mutex);
 
                     char notif[256];
                     snprintf(notif, sizeof(notif), "[NOTIFICA] La partita #%d si e' conclusa in PAREGGIO.", notif_mid);
