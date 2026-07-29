@@ -20,6 +20,7 @@
 #else
     #include <sys/socket.h>
     #include <netinet/in.h>
+    #include <netinet/tcp.h>
     #include <arpa/inet.h>
     #include <unistd.h>
     #define close_socket(s) close(s)
@@ -92,6 +93,15 @@ void broadcast_notification(const char *text, SOCKET ex1, SOCKET ex2) {
         }
     }
     pthread_mutex_unlock(&server_mutex);
+}
+
+/* Helper: find Client* by socket (caller must hold server_mutex) */
+static Client *find_client_by_socket(SOCKET s) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].in_use && clients[i].sock == s)
+            return &clients[i];
+    }
+    return NULL;
 }
 
 /* Client Handler Thread */
@@ -239,10 +249,26 @@ void *client_handler(void *arg) {
                         }
                     }
 
+                    /* Check if host already has a pending join request on ANY match */
+                    int host_has_pending = 0;
+                    for (int j = 0; j < MAX_MATCHES; j++) {
+                        if (matches[j].state == MATCH_STATE_JOIN_PENDING &&
+                            matches[j].host_socket == target_match->host_socket) {
+                            host_has_pending = 1;
+                            break;
+                        }
+                    }
+
                     if (host_busy) {
                         tx_pkt.status = 0;
                         snprintf(tx_pkt.text, sizeof(tx_pkt.text),
                                  "Il creatore della partita (%s) e' al momento impegnato in un'altra partita in corso.",
+                                 target_match->host_nick);
+                        send_packet(sock, &tx_pkt);
+                    } else if (host_has_pending) {
+                        tx_pkt.status = 0;
+                        snprintf(tx_pkt.text, sizeof(tx_pkt.text),
+                                 "Il creatore %s ha gia' una richiesta di sfida in sospeso. Riprova tra poco.",
                                  target_match->host_nick);
                         send_packet(sock, &tx_pkt);
                     } else {
@@ -282,6 +308,25 @@ void *client_handler(void *arg) {
 
                 if (m && m->state == MATCH_STATE_JOIN_PENDING) {
                     SOCKET guest_s = (SOCKET)m->guest_socket;
+
+                    /* RACE CONDITION GUARD: verify guest is still connected */
+                    Client *guest_cli = find_client_by_socket(guest_s);
+                    if (!guest_cli) {
+                        /* Guest disconnected while host was deciding */
+                        m->state = MATCH_STATE_WAITING;
+                        m->guest_socket = -1;
+                        m->guest_nick[0] = '\0';
+
+                        Packet notify_pkt;
+                        memset(&notify_pkt, 0, sizeof(Packet));
+                        notify_pkt.type = MSG_NOTIFICATION;
+                        snprintf(notify_pkt.text, sizeof(notify_pkt.text),
+                                 "Lo sfidante si e' disconnesso prima della tua risposta. La partita #%d torna IN ATTESA.", target_id);
+                        send_packet(sock, &notify_pkt);
+                        pthread_mutex_unlock(&server_mutex);
+                        break;
+                    }
+
                     int host_busy = 0, guest_busy = 0;
                     for (int ci = 0; ci < MAX_CLIENTS; ci++) {
                         if (clients[ci].in_use) {
@@ -345,6 +390,28 @@ void *client_handler(void *arg) {
                         snprintf(notif, sizeof(notif),
                                  "[NOTIFICA] La partita #%d (%s vs %s) e' ora IN CORSO!",
                                  m->match_id, m->host_nick, m->guest_nick);
+                        /* AUTO-REJECT: reject all other JOIN_PENDING matches for this host */
+                        for (int mi = 0; mi < MAX_MATCHES; mi++) {
+                            if (&matches[mi] == m) continue; /* skip current match */
+                            if (matches[mi].state == MATCH_STATE_JOIN_PENDING &&
+                                matches[mi].host_socket == m->host_socket) {
+                                /* Notify pending guest that host is now busy */
+                                Packet reject_pkt;
+                                memset(&reject_pkt, 0, sizeof(Packet));
+                                reject_pkt.type   = MSG_JOIN_RESULT;
+                                reject_pkt.status = 0;
+                                reject_pkt.match_id = matches[mi].match_id;
+                                snprintf(reject_pkt.text, sizeof(reject_pkt.text),
+                                         "Partita rifiutata: il giocatore %s e' ora impegnato in un'altra partita.",
+                                         m->host_nick);
+                                send_packet((SOCKET)matches[mi].guest_socket, &reject_pkt);
+                                /* Reset match back to WAITING */
+                                matches[mi].state = MATCH_STATE_WAITING;
+                                matches[mi].guest_socket = -1;
+                                matches[mi].guest_nick[0] = '\0';
+                            }
+                        }
+
                         pthread_mutex_unlock(&server_mutex);
                         broadcast_notification(notif, (SOCKET)m->host_socket, guest_s);
                         pthread_mutex_lock(&server_mutex);
@@ -639,32 +706,159 @@ void *client_handler(void *arg) {
 
 cleanup:
     pthread_mutex_lock(&server_mutex);
+    printf("[SERVER] Cleanup per client '%s' (socket %d)...\n", cli->nickname, (int)sock);
     cli->in_use = 0;
     cli->sock = INVALID_SOCKET;
-    
-    /* Clean up any active match tied to this client */
+    cli->active_match_id = -1;
+
+    /* ================================================================
+     * Gestione robusta disconnessione: ogni stato della partita
+     * ================================================================ */
     for (int i = 0; i < MAX_MATCHES; i++) {
-        if (matches[i].state != MATCH_STATE_EMPTY) {
-            if (matches[i].host_socket == (int)sock || matches[i].guest_socket == (int)sock) {
-                int other = (matches[i].host_socket == (int)sock) ? matches[i].guest_socket : matches[i].host_socket;
-                if (matches[i].state == MATCH_STATE_IN_PROGRESS && other != -1) {
-                    Packet forfeit;
-                    memset(&forfeit, 0, sizeof(Packet));
-                    forfeit.type = MSG_GAME_OVER;
-                    forfeit.status = 1; /* Win by forfeit */
-                    snprintf(forfeit.text, sizeof(forfeit.text), "L'avversario si e' disconnesso. VITTORIA PER ABBANDONO! 🏆");
-                    send_packet((SOCKET)other, &forfeit);
+        Match *m = &matches[i];
+        if (m->state == MATCH_STATE_EMPTY) continue;
+
+        int is_host  = (m->host_socket  == (int)sock);
+        int is_guest = (m->guest_socket == (int)sock);
+        if (!is_host && !is_guest) continue;
+
+        int other_sock = is_host ? m->guest_socket : m->host_socket;
+        char match_notif[256];
+
+        switch (m->state) {
+
+        case MATCH_STATE_WAITING: {
+            /* Host disconnesso mentre attendeva uno sfidante:
+             * distrugge la partita, nessun guest da notificare */
+            int dead_mid = m->match_id;
+            snprintf(match_notif, sizeof(match_notif),
+                     "[NOTIFICA] La partita #%d (creata da %s) e' stata annullata per disconnessione dell'host.",
+                     m->match_id, m->host_nick);
+            pthread_mutex_destroy(&m->mutex);
+            pthread_cond_destroy(&m->cond);
+            memset(m, 0, sizeof(Match));
+            m->state = MATCH_STATE_EMPTY;
+            printf("[SERVER] Partita #%d distrutta (host disconnesso in WAITING).\n", dead_mid);
+            pthread_mutex_unlock(&server_mutex);
+            broadcast_notification(match_notif, sock, INVALID_SOCKET);
+            pthread_mutex_lock(&server_mutex);
+            break;
+        }
+
+        case MATCH_STATE_JOIN_PENDING:
+            if (is_host) {
+                /* Host disconnesso: notifica al guest che la partita e' annullata */
+                if (other_sock != -1) {
+                    Packet cancel_pkt;
+                    memset(&cancel_pkt, 0, sizeof(Packet));
+                    cancel_pkt.type   = MSG_JOIN_RESULT;
+                    cancel_pkt.status = 0;
+                    cancel_pkt.match_id = m->match_id;
+                    snprintf(cancel_pkt.text, sizeof(cancel_pkt.text),
+                             "La partita #%d e' stata annullata: l'host %s si e' disconnesso.",
+                             m->match_id, m->host_nick);
+                    send_packet((SOCKET)other_sock, &cancel_pkt);
                 }
-                pthread_mutex_destroy(&matches[i].mutex);
-                pthread_cond_destroy(&matches[i].cond);
-                matches[i].state = MATCH_STATE_EMPTY;
+                snprintf(match_notif, sizeof(match_notif),
+                         "[NOTIFICA] La partita #%d e' stata annullata (host %s disconnesso).",
+                         m->match_id, m->host_nick);
+            } else {
+                /* Guest disconnesso: notifica all'host, rimetti in WAITING */
+                if (other_sock != -1) {
+                    Packet notify_pkt;
+                    memset(&notify_pkt, 0, sizeof(Packet));
+                    notify_pkt.type = MSG_NOTIFICATION;
+                    snprintf(notify_pkt.text, sizeof(notify_pkt.text),
+                             "Lo sfidante %s si e' disconnesso. La tua partita #%d torna IN ATTESA.",
+                             m->guest_nick, m->match_id);
+                    send_packet((SOCKET)other_sock, &notify_pkt);
+                }
+                /* Reset guest info, match goes back to WAITING */
+                m->guest_socket  = -1;
+                m->guest_nick[0] = '\0';
+                m->state = MATCH_STATE_WAITING;
+                snprintf(match_notif, sizeof(match_notif),
+                         "[NOTIFICA] Lo sfidante della partita #%d si e' disconnesso. Partita torna in attesa.",
+                         m->match_id);
+                printf("[SERVER] Partita #%d: guest disconnesso in JOIN_PENDING, torna in WAITING.\n", m->match_id);
+                pthread_mutex_unlock(&server_mutex);
+                broadcast_notification(match_notif, (SOCKET)other_sock, sock);
+                pthread_mutex_lock(&server_mutex);
+                continue; /* Don't destroy the match */
             }
+            /* Host disconnected: destroy match */
+            pthread_mutex_destroy(&m->mutex);
+            pthread_cond_destroy(&m->cond);
+            memset(m, 0, sizeof(Match));
+            m->state = MATCH_STATE_EMPTY;
+            pthread_mutex_unlock(&server_mutex);
+            broadcast_notification(match_notif, sock, INVALID_SOCKET);
+            pthread_mutex_lock(&server_mutex);
+            break;
+
+        case MATCH_STATE_IN_PROGRESS:
+            /* Partita in corso: l'avversario vince per abbandono */
+            if (other_sock != -1) {
+                /* Send final grid to surviving player */
+                Packet grid_pkt;
+                memset(&grid_pkt, 0, sizeof(Packet));
+                grid_pkt.type = MSG_GRID_UPDATE;
+                grid_pkt.match_id = m->match_id;
+                grid_pkt.turn = 0;
+                memcpy(grid_pkt.grid, m->grid, sizeof(m->grid));
+                snprintf(grid_pkt.text, sizeof(grid_pkt.text), "Partita Terminata per disconnessione avversario!");
+                send_packet((SOCKET)other_sock, &grid_pkt);
+
+                Packet forfeit;
+                memset(&forfeit, 0, sizeof(Packet));
+                forfeit.type = MSG_GAME_OVER;
+                forfeit.status = 1; /* Win by forfeit */
+                snprintf(forfeit.text, sizeof(forfeit.text),
+                         "L'avversario si e' disconnesso. VITTORIA PER ABBANDONO! 🏆");
+                send_packet((SOCKET)other_sock, &forfeit);
+
+                /* CRITICAL: Reset active_match_id for the surviving player */
+                Client *survivor = find_client_by_socket((SOCKET)other_sock);
+                if (survivor) {
+                    survivor->active_match_id = -1;
+                }
+            }
+            snprintf(match_notif, sizeof(match_notif),
+                     "[NOTIFICA] La partita #%d si e' conclusa: %s si e' disconnesso. Vittoria a tavolino per l'avversario.",
+                     m->match_id, is_host ? m->host_nick : m->guest_nick);
+            printf("[SERVER] Partita #%d: forfeit per disconnessione di %s.\n",
+                   m->match_id, is_host ? m->host_nick : m->guest_nick);
+            pthread_mutex_destroy(&m->mutex);
+            pthread_cond_destroy(&m->cond);
+            memset(m, 0, sizeof(Match));
+            m->state = MATCH_STATE_EMPTY;
+            pthread_mutex_unlock(&server_mutex);
+            broadcast_notification(match_notif, (SOCKET)other_sock, sock);
+            pthread_mutex_lock(&server_mutex);
+            break;
+
+        case MATCH_STATE_TERMINATED:
+            /* Partita gia' conclusa: cleanup risorse */
+            if (other_sock != -1) {
+                Client *other_cli = find_client_by_socket((SOCKET)other_sock);
+                if (other_cli && other_cli->active_match_id == m->match_id) {
+                    other_cli->active_match_id = -1;
+                }
+            }
+            pthread_mutex_destroy(&m->mutex);
+            pthread_cond_destroy(&m->cond);
+            memset(m, 0, sizeof(Match));
+            m->state = MATCH_STATE_EMPTY;
+            break;
+
+        default:
+            break;
         }
     }
     pthread_mutex_unlock(&server_mutex);
 
     close_socket(sock);
-    printf("[SERVER] Socket %d cleaned up.\n", (int)sock);
+    printf("[SERVER] Socket %d cleaned up completamente.\n", (int)sock);
     return NULL;
 }
 
@@ -735,6 +929,20 @@ int main(int argc, char *argv[]) {
 
         if (client_sock == INVALID_SOCKET) {
             continue;
+        }
+
+        /* Enable TCP keepalive for faster dead connection detection */
+        {
+            int keepalive = 1;
+            setsockopt(client_sock, SOL_SOCKET, SO_KEEPALIVE, (const char *)&keepalive, sizeof(keepalive));
+#ifndef _WIN32
+            int idle = 10;   /* Start probing after 10s of inactivity */
+            int interval = 5; /* Probe every 5s */
+            int count = 3;    /* Give up after 3 failed probes */
+            setsockopt(client_sock, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+            setsockopt(client_sock, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+            setsockopt(client_sock, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+#endif
         }
 
         pthread_mutex_lock(&server_mutex);

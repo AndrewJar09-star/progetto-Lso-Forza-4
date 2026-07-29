@@ -3,6 +3,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Count extra bytes in UTF-8 string (continuation bytes 0x80-0xBF).
+ * strlen() counts bytes, but printf %-Ns pads based on bytes, not visual chars.
+ * By adding extra_bytes to the width, we compensate for multi-byte characters. */
+static int utf8_extra_bytes(const char *s) {
+    int extra = 0;
+    if (!s) return 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if ((*p & 0xC0) == 0x80) extra++;
+    }
+    return extra;
+}
+
 void clear_screen(void) {
 #ifdef _WIN32
     system("cls");
@@ -98,10 +110,14 @@ void print_match_list(MatchInfo *matches, int count) {
             int pad_spaces = 20 - visible_len;
             if (pad_spaces < 0) pad_spaces = 0;
 
-            printf("%s│%s #%-3d %s│%s %-15s %s│%s %-15s %s│%s %s%s%s%*s %s│%s\n",
+            /* Calculate UTF-8 extra bytes for proper alignment */
+            int host_extra = utf8_extra_bytes(matches[i].host_nick);
+            int guest_extra = utf8_extra_bytes(g_nick);
+
+            printf("%s│%s #%-3d %s│%s %-*s %s│%s %-*s %s│%s %s%s%s%*s %s│%s\n",
                    COLOR_GRAY, COLOR_BOLD, matches[i].match_id, COLOR_GRAY,
-                   COLOR_RESET, matches[i].host_nick, COLOR_GRAY,
-                   COLOR_RESET, g_nick, COLOR_GRAY,
+                   COLOR_RESET, 15 + host_extra, matches[i].host_nick, COLOR_GRAY,
+                   COLOR_RESET, 15 + guest_extra, g_nick, COLOR_GRAY,
                    COLOR_RESET, color_code, raw_state, COLOR_RESET, pad_spaces, "",
                    COLOR_GRAY, COLOR_RESET);
         }
@@ -110,8 +126,9 @@ void print_match_list(MatchInfo *matches, int count) {
 }
 
 void print_menu(const char *nickname) {
+    int nick_extra = utf8_extra_bytes(nickname);
     printf("%s┌──────────────────────────────────────────────────────┐%s\n", COLOR_GRAY, COLOR_RESET);
-    printf("%s│%s  Giocatore: %s%-41s%s%s│%s\n", COLOR_GRAY, COLOR_BOLD, COLOR_CYAN, nickname, COLOR_RESET, COLOR_GRAY, COLOR_RESET);
+    printf("%s│%s  Giocatore: %s%-*s%s%s│%s\n", COLOR_GRAY, COLOR_BOLD, COLOR_CYAN, 41 + nick_extra, nickname, COLOR_RESET, COLOR_GRAY, COLOR_RESET);
     printf("%s├──────────────────────────────────────────────────────┤%s\n", COLOR_GRAY, COLOR_RESET);
     printf("%s│%s  [1]  Crea una nuova partita                         %s│%s\n", COLOR_GRAY, COLOR_RESET, COLOR_GRAY, COLOR_RESET);
     printf("%s│%s  [2]  Mostra elenco partite disponibili              %s│%s\n", COLOR_GRAY, COLOR_RESET, COLOR_GRAY, COLOR_RESET);

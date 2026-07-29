@@ -72,6 +72,41 @@ static int         g_join_mid    = -1;  /* match_id per cui host decide */
 static char        g_join_gnick[MAX_NICKNAME];
 static char        g_game_over_text[256];
 
+/* ======================================================
+ * Graceful shutdown: send MSG_DISCONNECT before exiting
+ * ====================================================== */
+static int send_packet(const Packet *pkt); /* forward declaration */
+
+static void send_disconnect_and_exit(void) {
+    if (g_sock != INVALID_SOCKET) {
+        Packet pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type = MSG_DISCONNECT;
+        send_packet(&pkt);  /* best-effort, ignore errors */
+        close_socket(g_sock);
+        g_sock = INVALID_SOCKET;
+    }
+}
+
+#ifdef _WIN32
+static BOOL WINAPI console_ctrl_handler(DWORD event) {
+    if (event == CTRL_C_EVENT || event == CTRL_CLOSE_EVENT ||
+        event == CTRL_BREAK_EVENT || event == CTRL_LOGOFF_EVENT ||
+        event == CTRL_SHUTDOWN_EVENT) {
+        send_disconnect_and_exit();
+        ExitProcess(0);
+        return TRUE;
+    }
+    return FALSE;
+}
+#else
+static void unix_signal_handler(int sig) {
+    (void)sig;
+    send_disconnect_and_exit();
+    _exit(0);
+}
+#endif
+
 /* Helper per parsing numeri da stdin */
 static int parse_input_num(const char *line) {
     while (*line == ' ') line++;
@@ -481,6 +516,7 @@ int main(int argc, char *argv[]) {
         GetConsoleMode(hOut, &dwMode);
         SetConsoleMode(hOut, dwMode | 0x0004 /* ENABLE_VIRTUAL_TERMINAL_PROCESSING */);
     }
+    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         fprintf(stderr, "[ERRORE] Winsock init fallita.\n");
@@ -488,6 +524,8 @@ int main(int argc, char *argv[]) {
     }
 #else
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, unix_signal_handler);
+    signal(SIGTERM, unix_signal_handler);
 #endif
 
     g_sock = socket(AF_INET, SOCK_STREAM, 0);

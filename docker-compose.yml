@@ -10,23 +10,10 @@ services:
       - "8888:8888"
     restart: unless-stopped
 
-  client1:
+  client:
     build:
       context: ./client
       dockerfile: Dockerfile
-    container_name: forza4-client1
-    depends_on:
-      - server
-    stdin_open: true
-    tty: true
-    environment:
-      - TERM=xterm-256color
-
-  client2:
-    build:
-      context: ./client
-      dockerfile: Dockerfile
-    container_name: forza4-client2
     depends_on:
       - server
     stdin_open: true
