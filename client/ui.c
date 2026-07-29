@@ -23,21 +23,21 @@ void print_banner(void) {
 void print_grid(char grid[ROWS][COLS]) {
     printf("\n");
     /* Intestazione numeri colonne */
-    printf("%s   1   2   3   4   5   6   7 %s\n", COLOR_BOLD, COLOR_RESET);
+    printf("%s    1    2    3    4    5    6    7%s\n", COLOR_BOLD, COLOR_RESET);
     
     /* Bordo superiore */
-    printf("%s ┌───┬───┬───┬───┬───┬───┬───┐%s\n", COLOR_GRAY, COLOR_RESET);
+    printf("%s ┌────┬────┬────┬────┬────┬────┬────┐%s\n", COLOR_GRAY, COLOR_RESET);
 
     for (int r = 0; r < ROWS; r++) {
         printf("%s │%s", COLOR_GRAY, COLOR_RESET);
         for (int c = 0; c < COLS; c++) {
             char cell = grid[r][c];
             if (cell == CELL_X) {
-                printf(" %s🔴%s", COLOR_RED, COLOR_RESET);
+                printf(" %s🔴%s ", COLOR_RED, COLOR_RESET);
             } else if (cell == CELL_O) {
-                printf(" %s🟡%s", COLOR_YELLOW, COLOR_RESET);
+                printf(" %s🟡%s ", COLOR_YELLOW, COLOR_RESET);
             } else {
-                printf("   ");
+                printf("    ");
             }
             printf("%s│%s", COLOR_GRAY, COLOR_RESET);
         }
@@ -45,10 +45,10 @@ void print_grid(char grid[ROWS][COLS]) {
 
         if (r < ROWS - 1) {
             /* Bordo intermedio */
-            printf("%s ├───┼───┼───┼───┼───┼───┼───┤%s\n", COLOR_GRAY, COLOR_RESET);
+            printf("%s ├────┼────┼────┼────┼────┼────┼────┤%s\n", COLOR_GRAY, COLOR_RESET);
         } else {
             /* Bordo inferiore */
-            printf("%s └───┴───┴───┴───┴───┴───┴───┘%s\n", COLOR_GRAY, COLOR_RESET);
+            printf("%s └────┴────┴────┴────┴────┴────┴────┘%s\n", COLOR_GRAY, COLOR_RESET);
         }
     }
     printf("\n");

@@ -109,6 +109,44 @@ static int recv_packet_exact(Packet *pkt) {
     return total;
 }
 
+/* Formatta il testo della griglia/turno sostituendo (X) e (O) con i cerchi 🔴 e 🟡 */
+static void print_formatted_grid_text(const char *text) {
+    if (!text || text[0] == '\0') return;
+    char buf[512];
+    const char *p = text;
+    char *out = buf;
+    size_t remaining = sizeof(buf) - 1;
+
+    while (*p && remaining > 1) {
+        if (strncmp(p, "(X - Rosso)", 11) == 0) {
+            size_t len = snprintf(out, remaining, "%s🔴%s", COLOR_RED, COLOR_CYAN);
+            if (len > remaining) len = remaining;
+            out += len; remaining -= len;
+            p += 11;
+        } else if (strncmp(p, "(X)", 3) == 0) {
+            size_t len = snprintf(out, remaining, "%s🔴%s", COLOR_RED, COLOR_CYAN);
+            if (len > remaining) len = remaining;
+            out += len; remaining -= len;
+            p += 3;
+        } else if (strncmp(p, "(O - Giallo)", 12) == 0) {
+            size_t len = snprintf(out, remaining, "%s🟡%s", COLOR_YELLOW, COLOR_CYAN);
+            if (len > remaining) len = remaining;
+            out += len; remaining -= len;
+            p += 12;
+        } else if (strncmp(p, "(O)", 3) == 0) {
+            size_t len = snprintf(out, remaining, "%s🟡%s", COLOR_YELLOW, COLOR_CYAN);
+            if (len > remaining) len = remaining;
+            out += len; remaining -= len;
+            p += 3;
+        } else {
+            *out++ = *p++;
+            remaining--;
+        }
+    }
+    *out = '\0';
+    printf("%s%s%s\n", COLOR_CYAN, buf, COLOR_RESET);
+}
+
 /* ======================================================
  * Gestione pacchetti in arrivo dal server
  * ====================================================== */
@@ -196,7 +234,7 @@ static void handle_server_packet(const Packet *pkt) {
         clear_screen();
         print_banner();
         print_grid((char (*)[COLS])pkt->grid);
-        printf("%s%s%s\n", COLOR_CYAN, pkt->text, COLOR_RESET);
+        print_formatted_grid_text(pkt->text);
         if (pkt->turn == g_my_symbol) {
             g_is_my_turn = 1;
             printf("\n%s>> E' IL TUO TURNO! Inserisci la colonna (1-7): %s",
