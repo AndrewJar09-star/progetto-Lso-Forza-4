@@ -2,10 +2,17 @@
  * client.c - Client Forza 4 multi-player
  *
  * Architettura: single-threaded con select() su socket + stdin (Linux/macOS).
- * Questo elimina ogni race condition tra rete e tastiera.
- * Su Windows (Docker usa Linux, quindi questa parte non è necessaria per Docker).
+ * Su Windows: select() con timeout + PeekConsoleInput / ReadConsoleInput.
  */
 
+#ifdef _WIN32
+    #ifndef WINVER
+        #define WINVER 0x0600
+    #endif
+    #ifndef _WIN32_WINNT
+        #define _WIN32_WINNT 0x0600
+    #endif
+#endif
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
 #endif
@@ -55,7 +62,6 @@ typedef enum {
     CLI_STATE_POST_DRAW     = 8
 } ClientState;
 
-
 static SOCKET      g_sock        = INVALID_SOCKET;
 static char        g_nickname[MAX_NICKNAME];
 static ClientState g_state       = CLI_STATE_LOBBY;
@@ -65,6 +71,18 @@ static int         g_is_my_turn  = 0;
 static int         g_join_mid    = -1;  /* match_id per cui host decide */
 static char        g_join_gnick[MAX_NICKNAME];
 static char        g_game_over_text[256];
+
+/* Helper per parsing numeri da stdin */
+static int parse_input_num(const char *line) {
+    while (*line == ' ') line++;
+    if (*line == '#') line++;
+    if (*line == '\0') return -1;
+    char *endptr;
+    long val = strtol(line, &endptr, 10);
+    while (*endptr == ' ' || *endptr == '\r' || *endptr == '\n') endptr++;
+    if (*endptr != '\0') return -1;
+    return (int)val;
+}
 
 /* ======================================================
  * Helpers rete
@@ -113,14 +131,14 @@ static void handle_server_packet(const Packet *pkt) {
 
     case MSG_CREATE_MATCH_ACK:
         if (pkt->status == 1) {
+            g_match_id = pkt->match_id;
             g_state = CLI_STATE_LOBBY;
             printf("\n%s%s%s\n", COLOR_GREEN, pkt->text, COLOR_RESET);
-            printf("%s(Partita #%d creata ed in attesa. Puoi crearne altre dal menu.)%s\n",
-                   COLOR_YELLOW, pkt->match_id, COLOR_RESET);
             print_menu(g_nickname);
         } else {
-            printf("\n%s%s%s\n", COLOR_RED, pkt->text, COLOR_RESET);
+            g_match_id = -1;
             g_state = CLI_STATE_LOBBY;
+            printf("\n%s%s%s\n", COLOR_RED, pkt->text, COLOR_RESET);
             print_menu(g_nickname);
         }
         fflush(stdout);
@@ -148,6 +166,7 @@ static void handle_server_packet(const Packet *pkt) {
             printf("%s[Attesa avvio partita...]%s\n", COLOR_CYAN, COLOR_RESET);
         } else {
             g_state = CLI_STATE_LOBBY;
+            g_match_id = -1;
             printf("\n%s%s%s\n", COLOR_RED, pkt->text, COLOR_RESET);
             print_menu(g_nickname);
         }
@@ -155,6 +174,7 @@ static void handle_server_packet(const Packet *pkt) {
         break;
 
     case MSG_GAME_START:
+        g_match_id   = pkt->match_id;
         g_state      = CLI_STATE_IN_GAME;
         g_my_symbol  = pkt->status;
         g_is_my_turn = 0;
@@ -165,13 +185,14 @@ static void handle_server_packet(const Packet *pkt) {
         printf("Sfidante: %s%s%s | Il tuo Simbolo: %s%s%s\n",
                COLOR_CYAN, pkt->sender_nick, COLOR_RESET,
                (g_my_symbol == 1) ? COLOR_RED : COLOR_YELLOW,
-               (g_my_symbol == 1) ? "X (Rosso)" : "O (Giallo)", COLOR_RESET);
+               (g_my_symbol == 1) ? "🔴 (Rosso)" : "🟡 (Giallo)", COLOR_RESET);
         printf("%s=====================================================%s\n", COLOR_CYAN, COLOR_RESET);
         printf("%s[Aspetta il tuo turno...]%s\n", COLOR_YELLOW, COLOR_RESET);
         fflush(stdout);
         break;
 
     case MSG_GRID_UPDATE:
+        if (pkt->match_id > 0) g_match_id = pkt->match_id;
         clear_screen();
         print_banner();
         print_grid((char (*)[COLS])pkt->grid);
@@ -190,7 +211,6 @@ static void handle_server_packet(const Packet *pkt) {
 
     case MSG_MOVE_RESP:
         if (pkt->status == 0) {
-            /* Mossa invalida: il turno e' ancora del giocatore */
             printf("\n%s[ERRORE] %s%s\n", COLOR_RED, pkt->text, COLOR_RESET);
             printf("%s>> Riprova - colonna (1-7): %s", COLOR_GREEN, COLOR_RESET);
             g_is_my_turn = 1;
@@ -203,6 +223,20 @@ static void handle_server_packet(const Packet *pkt) {
         strncpy(g_game_over_text, pkt->text, sizeof(g_game_over_text) - 1);
         clear_screen();
         print_banner();
+
+        /* Se la vittoria è avvenuta per abbandono/disconnessione avversario */
+        if (strstr(pkt->text, "ABBANDONO") != NULL || strstr(pkt->text, "disconnesso") != NULL) {
+            printf("\n%s=====================================================%s\n", COLOR_GREEN, COLOR_RESET);
+            printf("%s  🏆 %s 🏆%s\n", COLOR_GREEN, g_game_over_text, COLOR_RESET);
+            printf("%s=====================================================%s\n", COLOR_GREEN, COLOR_RESET);
+            printf("\n%sL'avversario e' uscito dal gioco. Sei stato riportato in lobby.%s\n", COLOR_YELLOW, COLOR_RESET);
+            g_state = CLI_STATE_LOBBY;
+            g_match_id = -1;
+            print_menu(g_nickname);
+            fflush(stdout);
+            break;
+        }
+
         if (pkt->status == 1) {
             g_state = CLI_STATE_POST_WINNER;
             printf("\n%s=====================================================%s\n", COLOR_GREEN, COLOR_RESET);
@@ -216,7 +250,7 @@ static void handle_server_packet(const Packet *pkt) {
             printf("\n%s=====================================================%s\n", COLOR_RED, COLOR_RESET);
             printf("%s  ❌ %s ❌%s\n", COLOR_RED, g_game_over_text, COLOR_RESET);
             printf("%s=====================================================%s\n", COLOR_RED, COLOR_RESET);
-            printf("\n%sIl perdente deve lasciare la partita.%s\n", COLOR_YELLOW, COLOR_RESET);
+            printf("\n%sHai perso la partita.%s\n", COLOR_YELLOW, COLOR_RESET);
             printf("Premi INVIO per tornare alla lobby...");
         } else {
             g_state = CLI_STATE_POST_DRAW;
@@ -244,12 +278,7 @@ static void handle_user_line(char *line) {
     while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r' || line[len-1] == ' '))
         line[--len] = '\0';
 
-    /* Strip '#' prefix e spazi iniziali */
-    char *p = line;
-    while (*p == ' ') p++;
-    if (*p == '#') p++;
-
-    int val = (*p != '\0') ? atoi(p) : -1;
+    int val = parse_input_num(line);
 
     switch (g_state) {
 
@@ -273,6 +302,9 @@ static void handle_user_line(char *line) {
             send_packet(&pkt);
             printf("Arrivederci!\n");
             close_socket(g_sock);
+#ifdef _WIN32
+            WSACleanup();
+#endif
             exit(0);
         } else {
             print_menu(g_nickname);
@@ -289,7 +321,7 @@ static void handle_user_line(char *line) {
             send_packet(&pkt);
             printf("%s[Richiesta di unirsi alla partita #%d inviata, attendo risposta...]%s\n",
                    COLOR_CYAN, val, COLOR_RESET);
-            g_state = CLI_STATE_LOBBY; /* torna in lobby e aspetta MSG_JOIN_RESULT */
+            g_state = CLI_STATE_LOBBY;
             fflush(stdout);
         } else {
             printf("ID non valido. Inserisci un numero positivo: ");
@@ -319,7 +351,6 @@ static void handle_user_line(char *line) {
 
     case CLI_STATE_IN_GAME:
         if (!g_is_my_turn) {
-            /* Ignora input: non e' il tuo turno */
             break;
         }
         if (val >= 1 && val <= 7) {
@@ -346,8 +377,7 @@ static void handle_user_line(char *line) {
         send_packet(&pkt);
         if (choice == 1) {
             g_state = CLI_STATE_LOBBY;
-            printf("%s[Nuova sessione aperta per la partita #%d!]%s\n", COLOR_GREEN, g_match_id, COLOR_RESET);
-            print_menu(g_nickname);
+            printf("%s[Attesa riapertura sessione dal server...]%s\n", COLOR_GREEN, COLOR_RESET);
         } else {
             g_match_id = -1;
             g_state    = CLI_STATE_LOBBY;
@@ -358,7 +388,6 @@ static void handle_user_line(char *line) {
     }
 
     case CLI_STATE_POST_LOSER: {
-        /* Qualsiasi tasto: abbandona obbligatoriamente */
         Packet pkt; memset(&pkt, 0, sizeof(pkt));
         pkt.type     = MSG_POST_GAME_CHOICE;
         pkt.match_id = g_match_id;
@@ -383,7 +412,7 @@ static void handle_user_line(char *line) {
             g_state    = CLI_STATE_LOBBY;
             clear_screen(); print_banner(); print_menu(g_nickname);
         } else {
-            g_state = CLI_STATE_LOBBY; /* server notifichera' apertura nuova sessione */
+            g_state = CLI_STATE_LOBBY;
             printf("%s[Attendo la decisione dell'avversario...]%s\n", COLOR_CYAN, COLOR_RESET);
         }
         fflush(stdout);
@@ -391,7 +420,6 @@ static void handle_user_line(char *line) {
     }
 
     default:
-        /* In stati di attesa: ignora input */
         break;
     }
 }
@@ -407,6 +435,14 @@ int main(int argc, char *argv[]) {
     if (argc > 2) port = atoi(argv[2]);
 
 #ifdef _WIN32
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut != INVALID_HANDLE_VALUE) {
+        DWORD dwMode = 0;
+        GetConsoleMode(hOut, &dwMode);
+        SetConsoleMode(hOut, dwMode | 0x0004 /* ENABLE_VIRTUAL_TERMINAL_PROCESSING */);
+    }
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         fprintf(stderr, "[ERRORE] Winsock init fallita.\n");
@@ -448,47 +484,51 @@ int main(int argc, char *argv[]) {
     clear_screen();
     print_banner();
 
-    /* --- Registrazione sincrona --- */
-    printf("Inserisci il tuo Nickname: ");
-    fflush(stdout);
-
-    char nick_line[64];
-    if (!fgets(nick_line, sizeof(nick_line), stdin)) strcpy(nick_line, "Giocatore");
-    nick_line[strcspn(nick_line, "\r\n")] = '\0';
-    if (nick_line[0] == '\0') strcpy(nick_line, "Giocatore");
-    strncpy(g_nickname, nick_line, MAX_NICKNAME - 1);
-
-    Packet reg;
-    memset(&reg, 0, sizeof(reg));
-    reg.type = MSG_REGISTER;
-    strncpy(reg.sender_nick, g_nickname, MAX_NICKNAME - 1);
-    if (send_packet(&reg) < 0) {
-        fprintf(stderr, "[ERRORE] Invio nickname fallito.\n");
-        close_socket(g_sock);
-        return 1;
-    }
-
-    /* Attendi MSG_REGISTER_ACK, scarta eventuali notifiche spurie */
-    Packet ack;
+    /* --- Registrazione sincrona con retry per nickname duplicati --- */
     for (;;) {
-        memset(&ack, 0, sizeof(ack));
-        if (recv_packet_exact(&ack) <= 0) {
-            fprintf(stderr, "[ERRORE] Server disconnesso durante registrazione.\n");
+        printf("Inserisci il tuo Nickname: ");
+        fflush(stdout);
+
+        char nick_line[64];
+        if (!fgets(nick_line, sizeof(nick_line), stdin)) strcpy(nick_line, "Giocatore");
+        nick_line[strcspn(nick_line, "\r\n")] = '\0';
+        if (nick_line[0] == '\0') strcpy(nick_line, "Giocatore");
+        strncpy(g_nickname, nick_line, MAX_NICKNAME - 1);
+
+        Packet reg;
+        memset(&reg, 0, sizeof(reg));
+        reg.type = MSG_REGISTER;
+        strncpy(reg.sender_nick, g_nickname, MAX_NICKNAME - 1);
+        if (send_packet(&reg) < 0) {
+            fprintf(stderr, "[ERRORE] Invio nickname fallito.\n");
             close_socket(g_sock);
             return 1;
         }
-        if (ack.type == MSG_REGISTER_ACK) break;
+
+        Packet ack;
+        for (;;) {
+            memset(&ack, 0, sizeof(ack));
+            if (recv_packet_exact(&ack) <= 0) {
+                fprintf(stderr, "[ERRORE] Server disconnesso durante registrazione.\n");
+                close_socket(g_sock);
+                return 1;
+            }
+            if (ack.type == MSG_REGISTER_ACK) break;
+        }
+
+        if (ack.status == 1) {
+            printf("%s%s%s\n\n", COLOR_GREEN, ack.text, COLOR_RESET);
+            break;
+        } else {
+            printf("%s[ERRORE] %s%s\n\n", COLOR_RED, ack.text, COLOR_RESET);
+        }
     }
-    printf("%s%s%s\n\n", COLOR_GREEN, ack.text, COLOR_RESET);
+
     print_menu(g_nickname);
     fflush(stdout);
 
     /* ============================================================
-     * Loop principale: select() su socket + stdin
-     *
-     * select() blocca finche' c'e' qualcosa da leggere sul socket
-     * (pacchetto dal server) O sull'stdin (tasto premuto dall'utente).
-     * Non c'e' nessun thread separato: zero race conditions.
+     * Loop principale: select() su socket + input tastiera
      * ============================================================ */
     char   input_buf[256];
     int    input_pos = 0;
@@ -499,9 +539,6 @@ int main(int argc, char *argv[]) {
         FD_SET(g_sock, &rfds);
 
 #ifdef _WIN32
-        /* Windows: select() non gestisce stdin come fd.
-           Usiamo un timeout breve e leggiamo stdin in modo non bloccante
-           tramite PeekConsoleInput / ReadConsoleInput. */
         struct timeval tv;
         tv.tv_sec  = 0;
         tv.tv_usec = 50000; /* 50ms */
@@ -534,13 +571,11 @@ int main(int argc, char *argv[]) {
             /* Se c'e' input disponibile, leggi un carattere */
             if (events > 0) {
                 /* Usa ReadConsoleA per leggere un singolo carattere */
-                char ch = 0;
-                DWORD read_count = 0;
                 INPUT_RECORD ir;
-                DWORD num;
+                DWORD num = 0;
                 ReadConsoleInput(hIn, &ir, 1, &num);
                 if (num > 0 && ir.EventType == KEY_EVENT && ir.Event.KeyEvent.bKeyDown) {
-                    ch = ir.Event.KeyEvent.uChar.AsciiChar;
+                    char ch = ir.Event.KeyEvent.uChar.AsciiChar;
                     if (ch == '\r') {
                         printf("\n");
                         input_buf[input_pos] = '\0';
