@@ -695,7 +695,115 @@ void *client_handler(void *arg) {
                 break;
             }
 
-            case MSG_LEAVE_MATCH:
+            case MSG_LEAVE_MATCH: {
+                int target_id = rx_pkt.match_id;
+                pthread_mutex_lock(&server_mutex);
+
+                cli->active_match_id = -1;
+
+                Match *m = NULL;
+                for (int i = 0; i < MAX_MATCHES; i++) {
+                    if (matches[i].state != MATCH_STATE_EMPTY) {
+                        if (target_id > 0 && matches[i].match_id == target_id) {
+                            m = &matches[i];
+                            break;
+                        }
+                        if (matches[i].host_socket == (int)sock || matches[i].guest_socket == (int)sock) {
+                            m = &matches[i];
+                            break;
+                        }
+                    }
+                }
+
+                if (m) {
+                    int is_host = (m->host_socket == (int)sock);
+                    int other_sock = is_host ? m->guest_socket : m->host_socket;
+
+                    if (m->state == MATCH_STATE_IN_PROGRESS && other_sock != -1) {
+                        /* Send final grid update */
+                        Packet grid_pkt;
+                        memset(&grid_pkt, 0, sizeof(Packet));
+                        grid_pkt.type = MSG_GRID_UPDATE;
+                        grid_pkt.match_id = m->match_id;
+                        grid_pkt.turn = 0;
+                        memcpy(grid_pkt.grid, m->grid, sizeof(m->grid));
+                        snprintf(grid_pkt.text, sizeof(grid_pkt.text), "Partita Terminata per resa dell'avversario!");
+                        send_packet((SOCKET)other_sock, &grid_pkt);
+
+                        /* Send win by forfeit to opponent */
+                        Packet forfeit;
+                        memset(&forfeit, 0, sizeof(Packet));
+                        forfeit.type = MSG_GAME_OVER;
+                        forfeit.status = 1; /* Win by forfeit */
+                        snprintf(forfeit.text, sizeof(forfeit.text),
+                                 "L'avversario %s si e' ARRESO! VITTORIA PER ABBANDONO! 🏆", cli->nickname);
+                        send_packet((SOCKET)other_sock, &forfeit);
+
+                        /* Reset opponent's active_match_id */
+                        Client *survivor = find_client_by_socket((SOCKET)other_sock);
+                        if (survivor) {
+                            survivor->active_match_id = -1;
+                        }
+
+                        char notif[256];
+                        snprintf(notif, sizeof(notif),
+                                 "[NOTIFICA] La partita #%d si e' conclusa per resa di %s. Vittoria per %s.",
+                                 m->match_id, cli->nickname, is_host ? m->guest_nick : m->host_nick);
+
+                        pthread_mutex_destroy(&m->mutex);
+                        pthread_cond_destroy(&m->cond);
+                        memset(m, 0, sizeof(Match));
+                        m->state = MATCH_STATE_EMPTY;
+
+                        pthread_mutex_unlock(&server_mutex);
+                        broadcast_notification(notif, (SOCKET)other_sock, sock);
+                        pthread_mutex_lock(&server_mutex);
+                    } else if (m->state == MATCH_STATE_WAITING && is_host) {
+                        char notif[256];
+                        snprintf(notif, sizeof(notif),
+                                 "[NOTIFICA] La partita #%d e' stata cancellata da %s.",
+                                 m->match_id, cli->nickname);
+                        pthread_mutex_destroy(&m->mutex);
+                        pthread_cond_destroy(&m->cond);
+                        memset(m, 0, sizeof(Match));
+                        m->state = MATCH_STATE_EMPTY;
+                        pthread_mutex_unlock(&server_mutex);
+                        broadcast_notification(notif, sock, INVALID_SOCKET);
+                        pthread_mutex_lock(&server_mutex);
+                    } else if (m->state == MATCH_STATE_JOIN_PENDING) {
+                        if (is_host) {
+                            if (other_sock != -1) {
+                                Packet cancel_pkt;
+                                memset(&cancel_pkt, 0, sizeof(Packet));
+                                cancel_pkt.type = MSG_JOIN_RESULT;
+                                cancel_pkt.status = 0;
+                                snprintf(cancel_pkt.text, sizeof(cancel_pkt.text),
+                                         "La partita #%d e' stata annullata dall'host.", m->match_id);
+                                send_packet((SOCKET)other_sock, &cancel_pkt);
+                            }
+                            pthread_mutex_destroy(&m->mutex);
+                            pthread_cond_destroy(&m->cond);
+                            memset(m, 0, sizeof(Match));
+                            m->state = MATCH_STATE_EMPTY;
+                        } else {
+                            if (other_sock != -1) {
+                                Packet notify_pkt;
+                                memset(&notify_pkt, 0, sizeof(Packet));
+                                notify_pkt.type = MSG_NOTIFICATION;
+                                snprintf(notify_pkt.text, sizeof(notify_pkt.text),
+                                         "Lo sfidante %s si e' ritirato. La partita #%d torna IN ATTESA.", cli->nickname, m->match_id);
+                                send_packet((SOCKET)other_sock, &notify_pkt);
+                            }
+                            m->guest_socket = -1;
+                            m->guest_nick[0] = '\0';
+                            m->state = MATCH_STATE_WAITING;
+                        }
+                    }
+                }
+                pthread_mutex_unlock(&server_mutex);
+                break;
+            }
+
             case MSG_DISCONNECT:
                 goto cleanup;
 

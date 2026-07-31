@@ -272,12 +272,12 @@ static void handle_server_packet(const Packet *pkt) {
         print_formatted_grid_text(pkt->text);
         if (pkt->turn == g_my_symbol) {
             g_is_my_turn = 1;
-            printf("\n%s>> E' IL TUO TURNO! Inserisci la colonna (1-7): %s",
-                   COLOR_GREEN, COLOR_RESET);
+            printf("\n%s>> E' IL TUO TURNO! Inserisci la colonna (1-7) %s[00=Resa]%s: ",
+                   COLOR_GREEN, COLOR_DIM, COLOR_RESET);
         } else if (pkt->turn != 0) {
             g_is_my_turn = 0;
-            printf("\n%s[In attesa della mossa dell'avversario...]%s\n",
-                   COLOR_YELLOW, COLOR_RESET);
+            printf("\n%s[In attesa della mossa dell'avversario...]%s %s(Digita 00 per Resa)%s\n",
+                   COLOR_YELLOW, COLOR_RESET, COLOR_DIM, COLOR_RESET);
         }
         fflush(stdout);
         break;
@@ -298,7 +298,7 @@ static void handle_server_packet(const Packet *pkt) {
         print_banner();
 
         /* Se la vittoria è avvenuta per abbandono/disconnessione avversario */
-        if (strstr(pkt->text, "ABBANDONO") != NULL || strstr(pkt->text, "disconnesso") != NULL) {
+        if (strstr(pkt->text, "ABBANDONO") != NULL || strstr(pkt->text, "disconnesso") != NULL || strstr(pkt->text, "ARRESO") != NULL) {
             printf("\n%s=====================================================%s\n", COLOR_GREEN, COLOR_RESET);
             printf("%s  🏆 %s 🏆%s\n", COLOR_GREEN, g_game_over_text, COLOR_RESET);
             printf("%s=====================================================%s\n", COLOR_GREEN, COLOR_RESET);
@@ -423,7 +423,22 @@ static void handle_user_line(char *line) {
     }
 
     case CLI_STATE_IN_GAME:
+        if (strcmp(line, "00") == 0) {
+            Packet pkt; memset(&pkt, 0, sizeof(pkt));
+            pkt.type     = MSG_LEAVE_MATCH;
+            pkt.match_id = g_match_id;
+            send_packet(&pkt);
+            g_state      = CLI_STATE_LOBBY;
+            g_match_id   = -1;
+            g_is_my_turn = 0;
+            printf("\n%s[Ti sei arreso! Sei stato riportato alla lobby.]%s\n\n", COLOR_YELLOW, COLOR_RESET);
+            print_menu(g_nickname);
+            fflush(stdout);
+            break;
+        }
         if (!g_is_my_turn) {
+            printf("%s[In attesa della mossa dell'avversario. Digita 00 per Resa]%s\n", COLOR_YELLOW, COLOR_RESET);
+            fflush(stdout);
             break;
         }
         if (val >= 1 && val <= 7) {
@@ -436,7 +451,7 @@ static void handle_user_line(char *line) {
             printf("%s[Mossa inviata al server...]%s\n", COLOR_CYAN, COLOR_RESET);
             fflush(stdout);
         } else {
-            printf("%s[ERRORE] Inserisci un numero tra 1 e 7: %s", COLOR_RED, COLOR_RESET);
+            printf("%s[ERRORE] Inserisci un numero tra 1 e 7 (o 00 per Resa): %s", COLOR_RED, COLOR_RESET);
             fflush(stdout);
         }
         break;
